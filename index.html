@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DocScan – extract info from documents</title>
+<style>
+:root{--bg:#f7f7f5;--card:#fff;--text:#1d1d1b;--muted:#6b6b66;--line:#e2e2dd;--accent:#2f5bea;--accent-t:#fff;--chip:#eef2ff}
+@media(prefers-color-scheme:dark){:root{--bg:#161615;--card:#201f1e;--text:#ececea;--muted:#9a9a94;--line:#34332f;--accent:#7b9bff;--accent-t:#10131f;--chip:#262b42}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:960px;margin:0 auto;padding:32px 20px 64px}
+h1{margin:0 0 4px;font-size:28px}
+.sub{color:var(--muted);margin:0 0 24px}
+#drop{border:2px dashed var(--line);border-radius:14px;background:var(--card);padding:40px 20px;text-align:center;cursor:pointer;transition:.15s}
+#drop.over{border-color:var(--accent);background:var(--chip)}
+#drop b{color:var(--accent)}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:16px 0}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--text);padding:8px 14px;border-radius:8px;cursor:pointer}
+button.primary{background:var(--accent);color:var(--accent-t);border-color:var(--accent)}
+button:disabled{opacity:.5;cursor:default}
+.doc{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:14px 0}
+.doc h3{margin:0 0 2px;font-size:17px;word-break:break-all}
+.status{color:var(--muted);font-size:14px}
+.bar{height:4px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:8px}
+.bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+.cat{margin-top:12px}
+.cat h4{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.chip{display:inline-block;background:var(--chip);border-radius:6px;padding:2px 9px;margin:0 6px 6px 0;font-size:14px;cursor:pointer;word-break:break-all}
+table{border-collapse:collapse;font-size:14px}
+td{padding:2px 14px 2px 0;vertical-align:top}td:first-child{color:var(--muted)}
+details{margin-top:12px}summary{cursor:pointer;color:var(--muted);font-size:14px}
+pre{white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;max-height:240px;overflow:auto;font-size:13px}
+.err{color:#d33}
+.wide{overflow-x:auto}
+footer{margin-top:32px;color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+<main>
+  <h1>DocScan</h1>
+  <p class="sub">Drop PDFs, images, Word files or text files. Text is read (with OCR for scans) and key info is extracted. Everything runs in your browser; nothing is uploaded.</p>
+
+  <div id="drop"><p><b>Click to choose files</b> or drag them here</p><p class="status">PDF · PNG · JPG · TIFF · WEBP · DOCX · TXT</p></div>
+  <input id="file" type="file" multiple hidden accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.docx,.txt">
+
+  <div class="row">
+    <label><input type="checkbox" id="ocrAll"> Force OCR on PDFs</label>
+    <span style="flex:1"></span>
+    <button id="json" disabled>Download JSON</button>
+    <button id="csv" disabled>Download CSV</button>
+    <button id="clear" disabled>Clear</button>
+  </div>
+  <div id="results"></div>
+  <footer>Click any extracted value to copy it. Pattern matching is tuned for US-style formats.</footer>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const M = "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)";
+const PATTERNS = {
+  Emails: "[\\w.+-]+@[\\w-]+(?:\\.[\\w-]+)+",
+  URLs: "https?://[^\\s<>\")]+|www\\.[^\\s<>\")]+",
+  Phones: "(?<!\\d)(?:\\+?1[\\s.-]?)?(?:\\(\\d{3}\\)|\\d{3})[\\s.-]?\\d{3}[\\s.-]?\\d{4}(?!\\d)",
+  Dates: `\\b\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}\\b|\\b\\d{4}-\\d{2}-\\d{2}\\b|\\b${M}\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?,?\\s+\\d{4}\\b|\\b\\d{1,2}\\s+${M}\\.?,?\\s+\\d{4}\\b`,
+  Amounts: "[$€£]\\s?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?|\\b\\d{1,3}(?:,\\d{3})*\\.\\d{2}\\s?(?:USD|EUR|GBP)\\b",
+  "EIN": "\\b\\d{2}-\\d{7}\\b",
+  "ZIP codes": "\\b\\d{5}(?:-\\d{4})?\\b(?=\\s*$|\\s*\\n|,)"
+};
+const LABELED = {
+  "Invoice #": "invoice\\s*(?:no\\.?|number|#)\\s*[:#]?\\s*([A-Z0-9-]{3,})",
+  "PO #": "(?:p\\.?o\\.?|purchase order)\\s*(?:no\\.?|number|#)?\\s*[:#]?\\s*([A-Z0-9-]{3,})",
+  "Account #": "account\\s*(?:no\\.?|number|#)\\s*[:#]?\\s*([A-Z0-9-]{4,})",
+  "Total": "(?:total(?:\\s+due)?|amount\\s+due|balance\\s+due)\\s*:?\\s*([$€£]?\\s?\\d[\\d,]*\\.?\\d*)",
+  "Due date": `due\\s*(?:date)?\\s*:?\\s*(\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}|${M}\\.?\\s+\\d{1,2},?\\s+\\d{4})`
+};
+
+function extract(text) {
+  const out = {fields: {}};
+  for (const [k, p] of Object.entries(PATTERNS)) {
+    const seen = new Set(), vals = [];
+    for (const m of text.matchAll(new RegExp(p, "gim"))) {
+      const v = m[0].trim().replace(/[.,;]+$/, "");
+      if (v && !seen.has(v.toLowerCase())) { seen.add(v.toLowerCase()); vals.push(v); }
+    }
+    if (vals.length) out[k] = vals;
+  }
+  for (const [k, p] of Object.entries(LABELED)) {
+    const m = text.match(new RegExp(p, "i"));
+    if (m) out.fields[k] = m[1].trim();
+  }
+  return out;
+}
+
+let worker = null;
+async function getWorker(onProgress) {
+  if (!worker) worker = await Tesseract.createWorker("eng", 1, {logger: m => { if (m.status === "recognizing text") onProgress(m.progress); }});
+  return worker;
+}
+async function ocr(source, onProgress) {
+  const w = await getWorker(onProgress);
+  const { data } = await w.recognize(source);
+  return data.text;
+}
+
+async function readPdf(file, forceOcr, setStatus, setBar) {
+  const pdf = await pdfjsLib.getDocument({data: await file.arrayBuffer()}).promise;
+  const pages = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    setStatus(`Page ${i} of ${pdf.numPages}`);
+    setBar((i - 1) / pdf.numPages);
+    const page = await pdf.getPage(i);
+    let text = "";
+    if (!forceOcr) {
+      const tc = await page.getTextContent();
+      let line = [];
+      for (const it of tc.items) { line.push(it.str); if (it.hasEOL) { text += line.join("") + "\n"; line = []; } }
+      text += line.join(" ");
+    }
+    if (text.trim().length < 40) {
+      setStatus(`OCR page ${i} of ${pdf.numPages}`);
+      const vp = page.getViewport({scale: 2.5});
+      const c = document.createElement("canvas");
+      c.width = vp.width; c.height = vp.height;
+      await page.render({canvasContext: c.getContext("2d"), viewport: vp}).promise;
+      text = await ocr(c, p => setBar((i - 1 + p) / pdf.numPages));
+    }
+    pages.push(text);
+  }
+  return pages.join("\n\n");
+}
+
+async function getText(file, forceOcr, setStatus, setBar) {
+  const ext = file.name.split(".").pop().toLowerCase();
+  if (ext === "pdf") return readPdf(file, forceOcr, setStatus, setBar);
+  if (ext === "docx") { setStatus("Reading Word file"); return (await mammoth.extractRawText({arrayBuffer: await file.arrayBuffer()})).value; }
+  if (ext === "txt") return file.text();
+  setStatus("Running OCR");
+  return ocr(file, setBar);
+}
+
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+const results = [];
+const esc = s => s.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function render(card, r) {
+  const e = r.extracted;
+  let html = `<h3>${esc(r.file)}</h3><div class="status">${r.chars.toLocaleString()} characters read</div>`;
+  if (Object.keys(e.fields).length) html += `<div class="cat"><h4>Labeled fields</h4><div class="wide"><table>${Object.entries(e.fields).map(([k, v]) => `<tr><td>${esc(k)}</td><td><span class="chip">${esc(v)}</span></td></tr>`).join("")}</table></div></div>`;
+  for (const [k, vals] of Object.entries(e)) if (k !== "fields") html += `<div class="cat"><h4>${esc(k)}</h4>${vals.map(v => `<span class="chip">${esc(v)}</span>`).join("")}</div>`;
+  if (!Object.keys(e).some(k => k !== "fields") && !Object.keys(e.fields).length) html += `<p class="status">Nothing matched the built-in patterns.</p>`;
+  html += `<details><summary>Show raw text</summary><pre>${esc(r.text)}</pre></details>`;
+  card.innerHTML = html;
+}
+
+async function handle(files) {
+  for (const file of files) {
+    const card = document.createElement("div");
+    card.className = "doc";
+    card.innerHTML = `<h3>${esc(file.name)}</h3><div class="status">Starting…</div><div class="bar"><i></i></div>`;
+    $("results").prepend(card);
+    const setStatus = s => card.querySelector(".status").textContent = s;
+    const setBar = p => card.querySelector(".bar i").style.width = Math.round(p * 100) + "%";
+    try {
+      const text = await getText(file, $("ocrAll").checked, setStatus, setBar);
+      const r = {file: file.name, chars: text.length, extracted: extract(text), text};
+      results.push(r);
+      render(card, r);
+    } catch (err) {
+      card.innerHTML = `<h3>${esc(file.name)}</h3><div class="err">Failed: ${esc(err.message || String(err))}</div>`;
+    }
+    ["json", "csv", "clear"].forEach(id => $(id).disabled = !results.length);
+  }
+}
+
+function download(name, data, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([data], {type}));
+  a.download = name; a.click(); URL.revokeObjectURL(a.href);
+}
+
+$("drop").onclick = () => $("file").click();
+$("file").onchange = e => { handle([...e.target.files]); e.target.value = ""; };
+$("drop").ondragover = e => { e.preventDefault(); $("drop").classList.add("over"); };
+$("drop").ondragleave = () => $("drop").classList.remove("over");
+$("drop").ondrop = e => { e.preventDefault(); $("drop").classList.remove("over"); handle([...e.dataTransfer.files]); };
+$("results").onclick = e => { if (e.target.classList.contains("chip")) navigator.clipboard?.writeText(e.target.textContent); };
+$("json").onclick = () => download("extracted.json", JSON.stringify(results.map(({text, ...r}) => r), null, 2), "application/json");
+$("csv").onclick = () => {
+  const q = v => `"${String(v).replace(/"/g, '""')}"`;
+  const rows = [["file", "category", "value"]];
+  for (const r of results) for (const [k, v] of Object.entries(r.extracted)) {
+    if (k === "fields") for (const [fk, fv] of Object.entries(v)) rows.push([r.file, fk, fv]);
+    else v.forEach(x => rows.push([r.file, k, x]));
+  }
+  download("extracted.csv", rows.map(r => r.map(q).join(",")).join("\n"), "text/csv");
+};
+$("clear").onclick = () => { results.length = 0; $("results").innerHTML = ""; ["json", "csv", "clear"].forEach(id => $(id).disabled = true); };
+</script>
+</body>
+</html>
